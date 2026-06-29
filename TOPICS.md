@@ -129,6 +129,8 @@ ros2 topic pub --once /command std_msgs/String \
 | `odom_frame_id` | string | `odom` | Кадр одометрии (родитель `base_link`). |
 | `publish_odom` | bool | `true` | Публиковать топик `/odom` (относительно старта). |
 | `convert_sim_to_ros` | bool | `true` | Конвертировать позу из СК симулятора (ось вверх Y) в СК ROS (ось вверх Z). |
+| `laser_reverse` | bool | `true` | Зеркалировать развёртку лидара (CW симулятора → CCW ROS). |
+| `laser_angle_offset` | float | `0.0` | Доп. угловое смещение развёртки лидара, градусы. |
 | `laser_z_offset` | float | `0.10` | Высота лидара над `base_link` (м). |
 | `camera_x_offset` | float | `0.10` | Смещение камеры вперёд от `base_link` (м). |
 | `laser_angle_min` | float | `0.0` | Начальный угол лидара (рад). |

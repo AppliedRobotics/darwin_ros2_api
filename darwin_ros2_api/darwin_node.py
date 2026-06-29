@@ -261,6 +261,15 @@ class DarwinNode(Node):
             self.declare_parameter('laser_range_min', 0.0).value)
         self.laser_range_max = float(
             self.declare_parameter('laser_range_max', 30.0).value)
+        # Симулятор (левая СК) отдаёт развёртку лидара по часовой стрелке,
+        # а ROS LaserScan считает, что угол растёт против часовой. Поэтому
+        # массив дальностей зеркалируем (иначе право/лево меняются местами).
+        self.laser_reverse = bool(
+            self.declare_parameter('laser_reverse', True).value)
+        # Доп. угловое смещение развёртки (градусы) для выравнивания
+        # направления "вперёд", если нулевой луч лидара смотрит не вперёд.
+        self.laser_angle_offset = float(
+            self.declare_parameter('laser_angle_offset', 0.0).value)
         # Множитель для cmd_vel.angular.z (rad/s -> град/с) для дрона.
         self.cmd_vel_yaw_is_degrees = bool(
             self.declare_parameter('cmd_vel_yaw_is_degrees', False).value)
@@ -295,7 +304,7 @@ class DarwinNode(Node):
         self._odom_pub = None
 
         sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            # reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
@@ -617,7 +626,19 @@ class DarwinNode(Node):
         msg.angle_increment = span / float(n) if n > 0 else 0.0
         msg.range_min = self.laser_range_min
         msg.range_max = self.laser_range_max
-        msg.ranges = [float(r) for r in ranges]
+
+        values = [float(r) for r in ranges]
+        if self.laser_reverse and n > 1:
+            # Зеркалирование относительно оси "вперёд": new[0]=old[0],
+            # new[k]=old[n-k]. Переводит развёртку CW -> CCW.
+            values = [values[0]] + values[:0:-1]
+        if self.laser_angle_offset and n > 0:
+            inc = msg.angle_increment
+            shift = int(round(math.radians(self.laser_angle_offset) / inc)) % n \
+                if inc else 0
+            if shift:
+                values = values[-shift:] + values[:-shift]
+        msg.ranges = values
         pub.publish(msg)
 
     def _on_float_array(self, pub, data) -> None:

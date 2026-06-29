@@ -20,6 +20,8 @@
 
 Полезные параметры::
 
+    -p flight_height:=0.2      # высота полёта после взлёта, м
+    -p entry_forward_time:=2.0 # пролёт вперёд для влёта в лабиринт, с
     -p forward_speed:=0.4      # крейсерская скорость вперёд, м/с
     -p desired_right:=0.6      # желаемая дистанция до правой стены, м
     -p front_clearance:=0.8    # дистанция спереди, ниже которой крутим влево, м
@@ -39,7 +41,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-from std_msgs.msg import Empty
+import json
+
+from std_msgs.msg import Empty, String
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 
@@ -85,6 +89,12 @@ class MazeRightHandExample(Node):
             self.declare_parameter('control_rate', 10.0).value)  # Гц
         self.takeoff_wait = float(
             self.declare_parameter('takeoff_wait', 4.0).value)
+        # Высота полёта, устанавливаемая после взлёта (метры).
+        self.flight_height = float(
+            self.declare_parameter('flight_height', 0.3).value)
+        # Пролёт вперёд после взлёта, чтобы влететь в лабиринт (секунды).
+        self.entry_forward_time = float(
+            self.declare_parameter('entry_forward_time', 2.0).value)
 
         cmd_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -101,12 +111,17 @@ class MazeRightHandExample(Node):
         self._takeoff_pub = self.create_publisher(Empty, 'takeoff', cmd_qos)
         self._hover_pub = self.create_publisher(Empty, 'hover', cmd_qos)
         self._land_pub = self.create_publisher(Empty, 'land', cmd_qos)
+        # Сырые команды в /control (для setHeight и пр.).
+        self._command_pub = self.create_publisher(String, 'command', cmd_qos)
 
         self._scan = None
         self.create_subscription(LaserScan, 'scan', self._on_scan, sensor_qos)
 
         self._active = False
-        # Сначала взлетаем, даём набрать высоту, затем включаем контроллер.
+        self._entry_elapsed = 0.0
+        self._dt = 0.1  # период публикации cmd_vel, с (10 Гц)
+        # Сначала взлетаем, выходим на высоту, влетаем в лабиринт, затем
+        # включаем контроллер.
         self._init_timer = self.create_timer(2.0, self._takeoff)
 
     # ------------------------------------------------------------------
@@ -114,7 +129,39 @@ class MazeRightHandExample(Node):
         self._init_timer.cancel()
         self.get_logger().info('Взлёт...')
         self._takeoff_pub.publish(Empty())
-        self._init_timer = self.create_timer(self.takeoff_wait, self._begin)
+        self._init_timer = self.create_timer(self.takeoff_wait, self._set_height)
+
+    def _set_height(self):
+        self._init_timer.cancel()
+        self.get_logger().info(
+            f'Установка высоты полёта: {self.flight_height:.2f} м')
+        cmd = String()
+        cmd.data = json.dumps(
+            {'method': 'setHeight', 'params': self.flight_height})
+        self._command_pub.publish(cmd)
+        # Даём дрону выйти на заданную высоту, затем летим вперёд.
+        self._init_timer = self.create_timer(2.0, self._fly_forward)
+
+    def _fly_forward(self):
+        self._init_timer.cancel()
+        self.get_logger().info(
+            f'Пролёт вперёд {self.entry_forward_time:.1f} с '
+            f'({self.forward_speed:.2f} м/с)...')
+        self._entry_elapsed = 0.0
+        self._entry_timer = self.create_timer(self._dt, self._entry_step)
+
+    def _entry_step(self):
+        self._entry_elapsed += self._dt
+        if self._entry_elapsed >= self.entry_forward_time:
+            self._entry_timer.cancel()
+            twist = Twist()
+            self._cmd_pub.publish(twist)
+            self._begin()
+            return
+
+        twist = Twist()
+        twist.linear.x = self.forward_speed
+        self._cmd_pub.publish(twist)
 
     def _begin(self):
         self._init_timer.cancel()
@@ -167,7 +214,7 @@ class MazeRightHandExample(Node):
 
         max_yaw = math.radians(self.max_yaw_rate)
         twist = Twist()
-
+        print("front: ", self.front_clearance, " right: ", self.right_lost)
         if front < self.front_clearance:
             # Препятствие спереди — поворачиваем налево на месте (CCW, +).
             twist.linear.x = 0.0
