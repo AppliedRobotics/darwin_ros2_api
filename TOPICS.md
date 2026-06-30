@@ -1,4 +1,4 @@
-# ROS2-топики ноды `darwin_node`
+# ROS2-драйвер `darwin_ros2_api`
 
 Нода `darwin_node` (пакет `darwin_ros2_api`) — драйвер, который связывает
 WebSocket API симулятора Darwin с ROS2. Она **публикует** телеметрию из
@@ -12,6 +12,160 @@ WebSocket API симулятора Darwin с ROS2. Она **публикует**
 
 Имена топиков указаны относительно пространства имён ноды (по умолчанию
 без namespace, т.е. `/imu/data`, `/cmd_vel` и т.д.).
+
+---
+
+## Сборка пакета
+
+Пакет лежит в ROS2-workspace, например `~/projects/darwin_ws`.
+
+**Зависимости** (Ubuntu / ROS2 Humble):
+
+```bash
+sudo apt install ros-humble-cv-bridge python3-opencv python3-numpy python3-websocket
+```
+
+**Сборка** (из корня workspace):
+
+```bash
+cd ~/projects/darwin_ws
+colcon build --symlink-install --packages-select darwin_ros2_api
+source install/setup.bash
+```
+
+Флаг `--symlink-install` удобен при разработке: изменения в Python-коде
+подхватываются без пересборки (достаточно перезапустить ноду).
+
+Проверка, что пакет установился:
+
+```bash
+ros2 pkg list | grep darwin_ros2_api
+ros2 pkg executables darwin_ros2_api
+```
+
+Должны быть видны `darwin_node` и примеры (`example_takeoff_land`,
+`example_square_flight`, `example_maze_right_hand`, `example_line_follow`).
+
+> В каждом новом терминале нужно выполнять `source install/setup.bash`,
+> либо добавить это в `~/.bashrc`.
+
+---
+
+## Запуск через launch
+
+Рекомендуемый способ — launch-файл `darwin_node.launch.py`. Он запускает
+ноду `darwin_node` и подтягивает параметры из YAML-конфига.
+
+**Только драйвер** (параметры из `config/darwin_params.yaml`):
+
+```bash
+ros2 launch darwin_ros2_api darwin_node.launch.py
+```
+
+**С RViz2** (TF, лидар, одометрия, камера — конфиг `rviz/darwin.rviz`):
+
+```bash
+ros2 launch darwin_ros2_api darwin_node.launch.py rviz:=true
+```
+
+**Со своим файлом параметров**:
+
+```bash
+ros2 launch darwin_ros2_api darwin_node.launch.py \
+  params_file:=/path/to/my_params.yaml
+```
+
+**Со своим конфигом RViz**:
+
+```bash
+ros2 launch darwin_ros2_api darwin_node.launch.py \
+  rviz:=true rviz_config:=/path/to/my.rviz
+```
+
+### Аргументы launch-файла
+
+| Аргумент | По умолчанию | Описание |
+|----------|--------------|----------|
+| `params_file` | `share/darwin_ros2_api/config/darwin_params.yaml` | YAML с параметрами ноды |
+| `rviz` | `false` | Запускать ли RViz2 |
+| `rviz_config` | `share/darwin_ros2_api/rviz/darwin.rviz` | Конфиг RViz2 |
+
+### Запуск без launch (альтернатива)
+
+```bash
+ros2 run darwin_ros2_api darwin_node --ros-args \
+  --params-file install/darwin_ros2_api/share/darwin_ros2_api/config/darwin_params.yaml
+```
+
+### Примеры (после запуска darwin_node)
+
+```bash
+ros2 run darwin_ros2_api example_takeoff_land
+ros2 run darwin_ros2_api example_square_flight
+ros2 run darwin_ros2_api example_maze_right_hand
+ros2 run darwin_ros2_api example_line_follow
+```
+
+---
+
+## Настройка конфига
+
+Файл параметров: `config/darwin_params.yaml` (в исходниках пакета).
+После сборки копия устанавливается в:
+
+```
+install/darwin_ros2_api/share/darwin_ros2_api/config/darwin_params.yaml
+```
+
+При `--symlink-install` launch читает файл из `install/`, но он
+ссылается на исходник в `src/` — **редактируй файл в `src/`**, затем
+перезапусти launch.
+
+### Структура YAML
+
+Верхний ключ **обязан** совпадать с именем ноды (`darwin_node`):
+
+```yaml
+darwin_node:
+  ros__parameters:
+    host: "127.0.0.1"
+    port: 8765
+    # ...
+```
+
+### Что настраивать в первую очередь
+
+| Параметр | Зачем |
+|----------|-------|
+| `host` | IP-адрес машины с симулятором Darwin (WebSocket API) |
+| `port` | Порт WebSocket (по умолчанию `8765`) |
+| `auto_discover` | `true` — автоматически определить тип робота и потоки |
+| `robot_type` | Принудительно: `""`, `Drone` или `ForWdCar` |
+| `streams` | Принудительный список потоков (если автоопределение не подходит) |
+
+Пример для симулятора на другой машине:
+
+```yaml
+darwin_node:
+  ros__parameters:
+    host: "10.211.55.2"
+    port: 8765
+```
+
+### Перед запуском в симуляторе
+
+1. Включить **WebSocket API** в настройках Darwin Simulator.
+2. Загрузить сцену с роботом (дрон / машина).
+3. Перевести робота в **режим API** (иначе команды вернут ошибку
+   `api_input_mode_required`).
+
+### Просмотр топиков после запуска
+
+```bash
+ros2 topic list
+ros2 topic echo /imu/data
+ros2 topic echo /scan --qos-reliability best_effort
+```
 
 ---
 
@@ -140,25 +294,4 @@ ros2 topic pub --once /command std_msgs/String \
 | `cmd_vel_yaw_is_degrees` | bool | `false` | Трактовать `cmd_vel.angular.z` как град/с. |
 | `car_speed_scale` | float | `100.0` | Масштаб скорости для колёсной платформы. |
 
----
-
-## 4. Запуск
-
-Через launch-файл (рекомендуется — подтягивает `config/darwin_params.yaml`):
-
-```bash
-ros2 launch darwin_ros2_api darwin_node.launch.py host:=127.0.0.1 port:=8765
-```
-
-Напрямую:
-
-```bash
-ros2 run darwin_ros2_api darwin_node --ros-args -p host:=127.0.0.1 -p port:=8765
-```
-
-Просмотр доступных топиков после запуска:
-
-```bash
-ros2 topic list
-ros2 topic echo /imu/data
-```
+Полный файл с комментариями: `config/darwin_params.yaml`.
