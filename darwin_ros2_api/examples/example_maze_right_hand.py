@@ -1,262 +1,148 @@
 #!/usr/bin/env python3
-"""Прохождение лабиринта дроном по правилу правой руки (лидар).
+"""Пример: лабиринт по правилу правой руки (лидар).
 
-Реактивный контроллер следования вдоль правой стены: дрон держит
-правую стену на заданном расстоянии, поворачивает налево перед
-препятствием спереди и доворачивает направо, когда стена справа
-"теряется" (открытый проход) — это и есть правило правой руки.
+Дрон держит правую стену рядом с собой:
+  - стена справа далеко  -> поворачиваем направо
+  - препятствие впереди   -> поворачиваем налево
+  - иначе                -> летим вперёд
 
-Используются:
+Перед запуском должен работать darwin_node::
 
-* подписка на ``scan`` (``sensor_msgs/LaserScan``) — данные 2D-лидара;
-* публикация ``cmd_vel`` (``geometry_msgs/Twist``) — скорости (драйвер
-  переводит их в ``setVelXYYaw``); ``angular.z`` задаётся в рад/с;
-* ``takeoff`` / ``hover`` / ``land`` (``std_msgs/Empty``).
+    ros2 launch darwin_ros2_api darwin_node.launch.py
 
-Запуск (драйвер должен быть запущен заранее)::
+Запуск примера::
 
-    ros2 run darwin_ros2_api darwin_node --ros-args -p host:=127.0.0.1 -p port:=8765
     ros2 run darwin_ros2_api example_maze_right_hand
 
-Полезные параметры::
-
-    -p flight_height:=0.2      # высота полёта после взлёта, м
-    -p entry_forward_time:=2.0 # пролёт вперёд для влёта в лабиринт, с
-    -p forward_speed:=0.4      # крейсерская скорость вперёд, м/с
-    -p desired_right:=0.6      # желаемая дистанция до правой стены, м
-    -p front_clearance:=0.8    # дистанция спереди, ниже которой крутим влево, м
-    -p max_yaw_rate:=60.0      # макс. угловая скорость, град/с
-    -p right_angle_deg:=-90.0  # направление "вправо" в кадре лидара, град
-    -p front_angle_deg:=0.0    # направление "вперёд" в кадре лидара, град
-
-Замечание о геометрии лидара: соответствие индексов массива дальностей
-направлениям зависит от симулятора. По умолчанию принято, что 0° — это
-"вперёд", а угол растёт против часовой стрелки (право = -90°). Если дрон
-едет "не туда", подстройте ``front_angle_deg`` / ``right_angle_deg``.
+Остановка: Ctrl+C
 """
 
+import json
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-
-import json
-
-from std_msgs.msg import Empty, String
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Empty, String
+
+# --- настройки (можно менять прямо здесь) ---
+FLIGHT_HEIGHT = 0.3   # высота полёта, м
+ENTRY_TIME = 2.0      # секунд лететь вперёд, чтобы влететь в лабиринт
+SPEED = 0.4           # скорость вперёд, м/с
+WALL_DIST = 0.3      # желаемое расстояние до правой стены, м
+FRONT_STOP = 0.4      # если ближе — поворачиваем налево, м
+RIGHT_LOST = 1.0      # если правой стены нет — поворачиваем направо, м
+
+# последний скан лидара (обновляется в callback)
+scan = None
 
 
-def _clamp(value, lo, hi):
-    return max(lo, min(hi, value))
+def on_scan(msg):
+    global scan
+    scan = msg
 
 
-class MazeRightHandExample(Node):
-    """Следование вдоль правой стены лабиринта по данным лидара."""
-
-    def __init__(self):
-        super().__init__('example_maze_right_hand')
-
-        # --- Параметры движения -----------------------------------------
-        self.forward_speed = float(
-            self.declare_parameter('forward_speed', 0.4).value)
-        self.desired_right = float(
-            self.declare_parameter('desired_right', 0.6).value)
-        self.front_clearance = float(
-            self.declare_parameter('front_clearance', 0.8).value)
-        self.max_yaw_rate = float(
-            self.declare_parameter('max_yaw_rate', 60.0).value)  # град/с
-        # П-коэффициент регулятора дистанции до правой стены (рад/с на метр).
-        self.kp_wall = float(self.declare_parameter('kp_wall', 1.5).value)
-        # Порог "потери" правой стены: дальше — считаем, что стены нет.
-        self.right_lost = float(
-            self.declare_parameter('right_lost', 1.2).value)
-
-        # --- Геометрия лидара -------------------------------------------
-        self.front_angle_deg = float(
-            self.declare_parameter('front_angle_deg', 0.0).value)
-        self.right_angle_deg = float(
-            self.declare_parameter('right_angle_deg', -90.0).value)
-        # Полуширина секторов усреднения (берём минимум в секторе), град.
-        self.front_half_deg = float(
-            self.declare_parameter('front_half_deg', 25.0).value)
-        self.side_half_deg = float(
-            self.declare_parameter('side_half_deg', 25.0).value)
-
-        # --- Тайминги ----------------------------------------------------
-        self.control_rate = float(
-            self.declare_parameter('control_rate', 10.0).value)  # Гц
-        self.takeoff_wait = float(
-            self.declare_parameter('takeoff_wait', 4.0).value)
-        # Высота полёта, устанавливаемая после взлёта (метры).
-        self.flight_height = float(
-            self.declare_parameter('flight_height', 0.3).value)
-        # Пролёт вперёд после взлёта, чтобы влететь в лабиринт (секунды).
-        self.entry_forward_time = float(
-            self.declare_parameter('entry_forward_time', 2.0).value)
-
-        cmd_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
-        sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
-
-        self._cmd_pub = self.create_publisher(Twist, 'cmd_vel', cmd_qos)
-        self._takeoff_pub = self.create_publisher(Empty, 'takeoff', cmd_qos)
-        self._hover_pub = self.create_publisher(Empty, 'hover', cmd_qos)
-        self._land_pub = self.create_publisher(Empty, 'land', cmd_qos)
-        # Сырые команды в /control (для setHeight и пр.).
-        self._command_pub = self.create_publisher(String, 'command', cmd_qos)
-
-        self._scan = None
-        self.create_subscription(LaserScan, 'scan', self._on_scan, sensor_qos)
-
-        self._active = False
-        self._entry_elapsed = 0.0
-        self._dt = 0.1  # период публикации cmd_vel, с (10 Гц)
-        # Сначала взлетаем, выходим на высоту, влетаем в лабиринт, затем
-        # включаем контроллер.
-        self._init_timer = self.create_timer(2.0, self._takeoff)
-
-    # ------------------------------------------------------------------
-    def _takeoff(self):
-        self._init_timer.cancel()
-        self.get_logger().info('Взлёт...')
-        self._takeoff_pub.publish(Empty())
-        self._init_timer = self.create_timer(self.takeoff_wait, self._set_height)
-
-    def _set_height(self):
-        self._init_timer.cancel()
-        self.get_logger().info(
-            f'Установка высоты полёта: {self.flight_height:.2f} м')
-        cmd = String()
-        cmd.data = json.dumps(
-            {'method': 'setHeight', 'params': self.flight_height})
-        self._command_pub.publish(cmd)
-        # Даём дрону выйти на заданную высоту, затем летим вперёд.
-        self._init_timer = self.create_timer(2.0, self._fly_forward)
-
-    def _fly_forward(self):
-        self._init_timer.cancel()
-        self.get_logger().info(
-            f'Пролёт вперёд {self.entry_forward_time:.1f} с '
-            f'({self.forward_speed:.2f} м/с)...')
-        self._entry_elapsed = 0.0
-        self._entry_timer = self.create_timer(self._dt, self._entry_step)
-
-    def _entry_step(self):
-        self._entry_elapsed += self._dt
-        if self._entry_elapsed >= self.entry_forward_time:
-            self._entry_timer.cancel()
-            twist = Twist()
-            self._cmd_pub.publish(twist)
-            self._begin()
-            return
-
-        twist = Twist()
-        twist.linear.x = self.forward_speed
-        self._cmd_pub.publish(twist)
-
-    def _begin(self):
-        self._init_timer.cancel()
-        self._active = True
-        self.get_logger().info(
-            'Прохождение лабиринта по правилу правой руки...')
-        self._ctrl_timer = self.create_timer(
-            1.0 / self.control_rate, self._control_step)
-
-    # ------------------------------------------------------------------
-    def _on_scan(self, msg: LaserScan):
-        self._scan = msg
-
-    def _sector_min(self, scan: LaserScan, center_deg: float,
-                    half_deg: float) -> float:
-        """Минимальная валидная дальность в секторе вокруг center_deg.
-
-        Возвращает ``inf``, если в секторе нет валидных измерений
-        (нулевые/отрицательные значения трактуются как "нет препятствия").
-        """
-        center = math.radians(center_deg)
-        half = math.radians(half_deg)
-        best = float('inf')
-        ang = scan.angle_min
-        inc = scan.angle_increment
-        for r in scan.ranges:
-            a = ang
-            ang += inc
-            if not math.isfinite(r) or r <= 0.0 or r <= scan.range_min:
-                continue
-            # Разница углов, нормированная в [-pi, pi].
-            diff = math.atan2(math.sin(a - center), math.cos(a - center))
-            if abs(diff) <= half and r < best:
-                best = r
-        return best
-
-    def _control_step(self):
-        if not self._active:
-            return
-        scan = self._scan
-        if scan is None or not scan.ranges:
-            # Нет данных лидара — зависаем на месте.
-            self._cmd_pub.publish(Twist())
-            return
-
-        front = self._sector_min(scan, self.front_angle_deg,
-                                 self.front_half_deg)
-        right = self._sector_min(scan, self.right_angle_deg,
-                                 self.side_half_deg)
-
-        max_yaw = math.radians(self.max_yaw_rate)
-        twist = Twist()
-        print("front: ", self.front_clearance, " right: ", self.right_lost)
-        if front < self.front_clearance:
-            # Препятствие спереди — поворачиваем налево на месте (CCW, +).
-            twist.linear.x = 0.0
-            twist.angular.z = max_yaw
-        elif right > self.right_lost:
-            # Стена справа потеряна (открытый проход) — доворачиваем
-            # направо (CW, -) и одновременно движемся вперёд, чтобы
-            # "обогнуть" угол по правилу правой руки.
-            twist.linear.x = self.forward_speed * 0.6
-            twist.angular.z = -max_yaw * 0.8
-        else:
-            # Едем вдоль правой стены, П-регулятор держит дистанцию.
-            # err > 0 — слишком далеко от стены => поворот направо (-).
-            err = right - self.desired_right
-            yaw = -self.kp_wall * err
-            twist.linear.x = self.forward_speed
-            twist.angular.z = _clamp(yaw, -max_yaw, max_yaw)
-
-        self._cmd_pub.publish(twist)
-
-    # ------------------------------------------------------------------
-    def stop_and_land(self):
-        self._active = False
-        try:
-            self._hover_pub.publish(Empty())
-            self._land_pub.publish(Empty())
-        except Exception:  # noqa: BLE001
-            pass
+def wait(node, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        rclpy.spin_once(node, timeout_sec=0.1)
 
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = MazeRightHandExample()
+def move_forward(node, pub, speed, seconds):
+    twist = Twist()
+    twist.linear.x = speed
+    end = time.time() + seconds
+    while time.time() < end:
+        pub.publish(twist)
+        rclpy.spin_once(node, timeout_sec=0.0)
+        time.sleep(0.1)
+    pub.publish(Twist())
+
+
+def distance_at_deg(msg, deg):
+    """Расстояние в направлении deg градусов (0 = вперёд, -90 = справа)."""
+    angle = math.radians(deg)
+    i = int((angle - msg.angle_min) / msg.angle_increment)
+    i = max(0, min(i, len(msg.ranges) - 1))
+    r = msg.ranges[i]
+    if math.isfinite(r) and r > msg.range_min:
+        return r
+    return 999.0
+
+
+def distance_front(msg):
+    """Минимальное расстояние впереди (сектор ±25°)."""
+    return min(distance_at_deg(msg, d) for d in range(-10, 10, 5))
+
+
+def distance_right(msg):
+    """Минимальное расстояние справа (сектор около -90°)."""
+    return min(distance_at_deg(msg, d) for d in range(-100, -80, 5))
+
+
+def main():
+    rclpy.init()
+    node = Node('example_maze_right_hand')
+
+    cmd = node.create_publisher(Twist, 'cmd_vel', 10)
+    takeoff = node.create_publisher(Empty, 'takeoff', 10)
+    command = node.create_publisher(String, 'command', 10)
+    node.create_subscription(LaserScan, 'scan', on_scan, 10)
+
+    wait(node, 2)
+
+    # --- подготовка ---
+    node.get_logger().info('Взлёт')
+    takeoff.publish(Empty())
+    wait(node, 4)
+
+    node.get_logger().info(f'Высота {FLIGHT_HEIGHT} м')
+    msg = String()
+    msg.data = json.dumps({'method': 'setHeight', 'params': FLIGHT_HEIGHT})
+    command.publish(msg)
+    wait(node, 2)
+
+    node.get_logger().info('Влетаем в лабиринт')
+    move_forward(node, cmd, SPEED, ENTRY_TIME)
+
+    # --- основной цикл ---
+    node.get_logger().info('Правило правой руки (Ctrl+C для остановки)')
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.1)
+            if scan is None:
+                continue
+
+            front = scan.ranges[0]
+            right = scan.ranges[270]
+            print("right: ",right , " front: ", front)
+            twist = Twist()
+
+            if front < FRONT_STOP:
+                print("front < FRONT_STOP")
+                # стена впереди — поворот налево
+                twist.angular.z = math.radians(60)
+            elif right > RIGHT_LOST:
+                print("right > RIGHT_LOST")
+                # стены справа нет — поворот направо
+                twist.linear.x = SPEED * 0.6
+                twist.angular.z = -math.radians(48)
+            else:
+                print("near right wall")
+                # едем вдоль правой стены
+                twist.linear.x = SPEED
+                err = right - WALL_DIST
+                twist.angular.z = -0.5*err
+
+            cmd.publish(twist)
     except KeyboardInterrupt:
-        node.get_logger().info('Остановка: зависание и посадка.')
-        node.stop_and_land()
-    finally:
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        node.get_logger().info('Остановка')
+
+    cmd.publish(Twist())
+    node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == '__main__':

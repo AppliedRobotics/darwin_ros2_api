@@ -40,6 +40,8 @@ setup(
             'darwin_ros2_api.examples.example_square_flight:main',
             'example_maze_right_hand = '
             'darwin_ros2_api.examples.example_maze_right_hand:main',
+            'example_line_follow = '
+            'darwin_ros2_api.examples.example_line_follow:main',
         ],
     },
 )
