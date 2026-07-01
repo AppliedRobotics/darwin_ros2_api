@@ -30,8 +30,8 @@ from std_msgs.msg import Empty, String
 # --- настройки (можно менять прямо здесь) ---
 FLIGHT_HEIGHT = 0.3   # высота полёта, м
 ENTRY_TIME = 2.0      # секунд лететь вперёд, чтобы влететь в лабиринт
-SPEED = 0.4           # скорость вперёд, м/с
-WALL_DIST = 0.3      # желаемое расстояние до правой стены, м
+SPEED = 0.1      # скорость вперёд, м/с
+WALL_DIST = 0.25      # желаемое расстояние до правой стены, м
 FRONT_STOP = 0.4      # если ближе — поворачиваем налево, м
 RIGHT_LOST = 1.0      # если правой стены нет — поворачиваем направо, м
 
@@ -105,7 +105,7 @@ def main():
     wait(node, 2)
 
     node.get_logger().info('Влетаем в лабиринт')
-    move_forward(node, cmd, SPEED, ENTRY_TIME)
+    move_forward(node, cmd, 0.4, ENTRY_TIME)
 
     # --- основной цикл ---
     node.get_logger().info('Правило правой руки (Ctrl+C для остановки)')
@@ -127,14 +127,15 @@ def main():
             elif right > RIGHT_LOST:
                 print("right > RIGHT_LOST")
                 # стены справа нет — поворот направо
-                twist.linear.x = SPEED * 0.6
-                twist.angular.z = -math.radians(48)
+                twist.linear.x = 0.0
+                twist.angular.z = -math.radians(90)
             else:
-                print("near right wall")
                 # едем вдоль правой стены
                 twist.linear.x = SPEED
                 err = right - WALL_DIST
-                twist.angular.z = -0.5*err
+                twist.angular.z = 5*err
+                print("near right wall", " error: ", err)
+                
 
             cmd.publish(twist)
     except KeyboardInterrupt:
